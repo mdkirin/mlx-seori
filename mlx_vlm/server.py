@@ -425,7 +425,7 @@ class ChatMessage(FlexibleBaseModel):
             ResponseOutputMessageContentList,
         ]
     ] = Field(None, description="Content of the message.")
-    tool_calls: List = []
+    tool_calls: Optional[List] = None
 
 
 class GenerationParams(FlexibleBaseModel):
@@ -1305,7 +1305,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                             choices=choices,
                         )
 
-                        yield f"data: {chunk_data.model_dump_json()}\n\n"
+                        yield f"data: {chunk_data.model_dump_json(exclude_none=True)}\n\n"
 
                     if tool_parser_type is not None:
                         tool_calls = process_tool_calls(
@@ -1314,17 +1314,17 @@ async def chat_completions_endpoint(request: ChatRequest):
                             tools=tools,
                         )
                     else:
-                        tool_calls = {}
-                        tool_calls["calls"] = []
+                        tool_calls = {"calls": []}
 
                     # Signal stream end
+                    tc = tool_calls["calls"] or None  # 빈 배열 → None
                     choices = [
                         ChatStreamChoice(
                             finish_reason="stop",
                             delta=ChatMessage(
                                 role="assistant",
                                 content="",
-                                tool_calls=tool_calls["calls"],
+                                tool_calls=tc,
                             ),
                         )
                     ]
@@ -1336,7 +1336,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         usage=usage_stats,
                         choices=choices,
                     )
-                    yield f"data: {chunk_data.model_dump_json()}\n\n"
+                    yield f"data: {chunk_data.model_dump_json(exclude_none=True)}\n\n"
 
                     _record_last_request(
                         prompt_tokens=usage_stats.get("input_tokens", 0),
