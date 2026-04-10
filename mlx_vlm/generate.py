@@ -496,6 +496,178 @@ class PrefixCache:
         }
 
 
+def mtp_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    *,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
+    kv_bits: Optional[int] = None,
+    kv_group_size: int = 64,
+    quantized_kv_start: int = 0,
+    **_kwargs,
+) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
+    """MTP (Multi-Token Prediction) speculative decoding for VLM models.
+
+    Adapted from mlx-lm's mtp_generate_step to work with VLM model
+    structure (model.language_model).  Uses the model's native MTP head
+    to propose draft tokens, yielding up to 2 tokens per backbone step.
+
+    The language_model must implement ``mtp_forward`` and ``make_mtp_cache``.
+
+    Yields:
+        Tuple[mx.array, mx.array, bool]: (token, log-probs, from_draft).
+    """
+    import math
+    import random
+
+    lm = model.language_model
+    y = prompt.astype(mx.uint32)
+    prev_tokens = None
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(lm)
+        mtp_cache = lm.make_mtp_cache()
+    else:
+        n_main = len(lm.layers) if hasattr(lm, "layers") else len(lm.model.layers)
+        model_cache = prompt_cache[:n_main]
+        mtp_cache = prompt_cache[n_main:] or lm.make_mtp_cache()
+
+    _is_greedy = sampler is None
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    quantize_cache_fn = functools.partial(
+        maybe_quantize_kv_cache,
+        quantized_kv_start=quantized_kv_start,
+        kv_group_size=kv_group_size,
+        kv_bits=kv_bits,
+    )
+
+    def _process_and_sample(tokens, logits):
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
+        return sampler(logprobs), logprobs
+
+    def _clear_rollback():
+        for c in model_cache:
+            if hasattr(c, "rollback_state"):
+                c.rollback_state = None
+
+    def _rollback_draft():
+        for c in model_cache:
+            if hasattr(c, "rollback_state") and c.rollback_state is not None:
+                conv_snap, ssm_snap = c.rollback_state
+                c[0] = conv_snap
+                c[1] = ssm_snap
+                c.rollback_state = None
+            elif c.is_trimmable():
+                c.trim(1)
+        cache.trim_prompt_cache(mtp_cache, 1)
+
+    def _step_backbone(y, n_predict=1, n_confirmed=0):
+        with mx.stream(generation_stream):
+            logits, hidden = lm(
+                y[None], cache=model_cache, return_hidden=True, n_confirmed=n_confirmed
+            )
+            logits = logits[:, -n_predict:, :]
+            quantize_cache_fn(model_cache)
+            nonlocal prev_tokens
+            toks, lps = [], []
+            y_ctx = y if n_predict == 1 else y[: -(n_predict - 1)]
+            for i in range(n_predict):
+                if logits_processors:
+                    prev_tokens = (
+                        mx.concatenate([prev_tokens, y_ctx])
+                        if prev_tokens is not None
+                        else y_ctx
+                    )
+                tok, lp = _process_and_sample(prev_tokens, logits[:, i, :].squeeze(0))
+                toks.append(tok)
+                lps.append(lp)
+            return mx.stack(toks), mx.stack(lps), hidden
+
+    def _step_mtp(hidden_last, main_tok):
+        next_ids = main_tok.reshape(1, 1)
+        with mx.stream(generation_stream):
+            mtp_logits = lm.mtp_forward(hidden_last, next_ids, mtp_cache)
+            quantize_cache_fn(mtp_cache)
+            mtp_logits = mtp_logits[:, -1, :].squeeze(0)
+            draft_tok, draft_lp = _process_and_sample(prev_tokens, mtp_logits)
+        return draft_tok, draft_lp
+
+    def _prefill(y):
+        while y.size > 1:
+            n = min(prefill_step_size, y.size - 1)
+            lm(y[:n][None], cache=model_cache)
+            quantize_cache_fn(model_cache)
+            mx.eval([c.state for c in model_cache if hasattr(c, "state")])
+            y = y[n:]
+            mx.clear_cache()
+        return y
+
+    with mx.stream(generation_stream):
+        y = _prefill(y)
+
+    ntoks = 0
+    draft_tok = draft_lp = None
+
+    while ntoks < max_tokens:
+        if draft_tok is None:
+            toks, lps, hidden = _step_backbone(y, n_predict=1)
+            mx.eval(toks)
+            main_tok, main_lp = toks[0], lps[0]
+            ntoks += 1
+            yield main_tok.item(), main_lp, False
+            if ntoks >= max_tokens:
+                return
+            draft_tok, draft_lp = _step_mtp(hidden[:, -1:, :], main_tok)
+            mx.eval(draft_tok)
+            y = mx.array([main_tok.item()], mx.uint32)
+        else:
+            y_with_draft = mx.concatenate([y, mx.array([draft_tok.item()], mx.uint32)])
+            toks, lps, hidden = _step_backbone(y_with_draft, n_predict=2, n_confirmed=1)
+            mx.eval(toks, draft_tok)
+
+            verify_pred, bonus_tok = toks[0], toks[1]
+            verify_lp, bonus_lp = lps[0], lps[1]
+            draft_tok_id = draft_tok.item()
+
+            if _is_greedy:
+                accept = verify_pred.item() == draft_tok_id
+            else:
+                log_accept = (verify_lp[draft_tok_id] - draft_lp[draft_tok_id]).item()
+                accept = log_accept >= 0 or random.random() < math.exp(log_accept)
+
+            if accept:
+                _clear_rollback()
+                ntoks += 1
+                yield draft_tok_id, draft_lp, True
+                if ntoks >= max_tokens:
+                    return
+                ntoks += 1
+                yield bonus_tok.item(), bonus_lp, False
+                if ntoks >= max_tokens:
+                    return
+                draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_tok)
+                mx.eval(draft_tok)
+                y = mx.array([bonus_tok.item()], mx.uint32)
+            else:
+                _rollback_draft()
+                verify_tok_id = verify_pred.item()
+                ntoks += 1
+                yield verify_tok_id, verify_lp, False
+                if ntoks >= max_tokens:
+                    return
+                draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_pred)
+                mx.eval(draft_tok)
+                y = mx.array([verify_tok_id], mx.uint32)
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -852,11 +1024,114 @@ def stream_generate(
     else:
         tokenizer.thinking_budget_criteria = None
 
-    # Ensure we have a prompt_cache we can track for reuse
+    # MTP: use native multi-token prediction if available
+    use_mtp = kwargs.pop("mtp", False)
+    lm = model.language_model
+    has_mtp_head = hasattr(lm, "mtp_forward")
+    has_media = pixel_values is not None
+
+    if use_mtp and has_mtp_head and not has_media:
+        # MTP path: bypass generate_step, use mtp_generate_step directly
+        # Build sampler/processors for MTP
+        from mlx_lm.sample_utils import make_sampler as _make_sampler, make_logits_processors as _make_lp
+        _temp = kwargs.pop("temperature", DEFAULT_TEMPERATURE)
+        _top_p = kwargs.pop("top_p", 1.0)
+        _min_p = kwargs.pop("min_p", 0.0)
+        _top_k = kwargs.pop("top_k", 0)
+        _max_tokens = kwargs.pop("max_tokens", DEFAULT_MAX_TOKENS)
+        _rep_penalty = kwargs.pop("repetition_penalty", None)
+        _rep_ctx = kwargs.pop("repetition_context_size", 20)
+        _logit_bias = kwargs.pop("logit_bias", None)
+        _prompt_cache = kwargs.pop("prompt_cache", None)
+        _prefill_step = kwargs.pop("prefill_step_size", DEFAULT_PREFILL_STEP_SIZE)
+        _kv_bits = kwargs.pop("kv_bits", None)
+        _kv_group = kwargs.pop("kv_group_size", DEFAULT_KV_GROUP_SIZE)
+        _kv_qstart = kwargs.pop("quantized_kv_start", DEFAULT_QUANTIZED_KV_START)
+
+        _sampler = _make_sampler(temp=_temp, top_p=_top_p, min_p=_min_p, top_k=_top_k) if _temp > 0 else None
+        _processors = _make_lp(_logit_bias, _rep_penalty, _rep_ctx)
+
+        total_prompt_tokens = reused_prefix_len + input_ids.size
+        tracked_cache = _prompt_cache
+
+        mtp_gen = mtp_generate_step(
+            input_ids.flatten(),
+            model,
+            max_tokens=_max_tokens,
+            sampler=_sampler,
+            logits_processors=_processors or None,
+            prompt_cache=_prompt_cache,
+            prefill_step_size=_prefill_step or DEFAULT_PREFILL_STEP_SIZE,
+            kv_bits=_kv_bits,
+            kv_group_size=_kv_group,
+            quantized_kv_start=_kv_qstart,
+        )
+
+        with wired_limit(model, [generation_stream]):
+            detokenizer = processor.detokenizer
+            detokenizer.reset()
+            tic = time.perf_counter()
+            generated_tokens = []
+
+            for n, (token, logprobs, from_draft) in enumerate(mtp_gen):
+                if n == 0:
+                    prompt_time = time.perf_counter() - tic
+                    prompt_tps = total_prompt_tokens / prompt_time
+                    tic = time.perf_counter()
+
+                generated_tokens.append(token)
+
+                if tokenizer.stopping_criteria(token):
+                    break
+
+                detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
+
+                yield GenerationResult(
+                    text=detokenizer.last_segment,
+                    token=token,
+                    logprobs=logprobs,
+                    prompt_tokens=total_prompt_tokens,
+                    generation_tokens=n + 1,
+                    total_tokens=total_prompt_tokens + n + 1,
+                    prompt_tps=prompt_tps,
+                    generation_tps=(n + 1) / (time.perf_counter() - tic),
+                    peak_memory=mx.get_peak_memory() / 1e9,
+                )
+
+            detokenizer.finalize()
+            yield GenerationResult(
+                text=detokenizer.last_segment,
+                token=token,
+                logprobs=logprobs,
+                prompt_tokens=total_prompt_tokens,
+                generation_tokens=n + 1,
+                total_tokens=total_prompt_tokens + n + 1,
+                prompt_tps=prompt_tps,
+                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                peak_memory=mx.get_peak_memory() / 1e9,
+            )
+
+            if prompt_cache_state is not None and tracked_cache is not None:
+                all_ids = full_input_ids_list + [
+                    t.item() if hasattr(t, "item") else t for t in generated_tokens
+                ]
+                prompt_cache_state.update(all_ids, tracked_cache)
+
+            mx.clear_cache()
+        return
+
+    elif use_mtp and not has_mtp_head:
+        import warnings
+        warnings.warn(
+            "--mtp flag ignored: model does not have an MTP head. "
+            "Falling back to standard generation.",
+            stacklevel=2,
+        )
+
+    # Standard path (non-MTP)
     if "prompt_cache" not in kwargs:
         kwargs["prompt_cache"] = cache.make_prompt_cache(
-            model.language_model,
-            max_kv_size=kwargs.get("max_kv_size", None),
+            lm, max_kv_size=kwargs.get("max_kv_size", None),
         )
     tracked_cache = kwargs["prompt_cache"]
 
@@ -878,17 +1153,14 @@ def stream_generate(
 
             generated_tokens.append(token)
 
-            # Check thinking budget and force token if needed
             if thinking_criteria is not None:
                 thinking_criteria(token)
 
-            # Stop generation if the token is in the eos_token_ids
             if tokenizer.stopping_criteria(token):
                 break
 
             detokenizer.add_token(token, skip_special_token_ids=skip_special_token_ids)
 
-            # Yield the last segment if streaming
             yield GenerationResult(
                 text=detokenizer.last_segment,
                 token=token,

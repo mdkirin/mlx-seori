@@ -1268,6 +1268,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         audio=audio,
                         vision_cache=model_cache.get("vision_cache"),
                         prefix_cache=prefix_cache,
+                        mtp=os.environ.get("MLX_MTP", "").lower() in ("1", "true"),
                         **generation_kwargs,
                     )
 
@@ -1709,6 +1710,13 @@ def main():
         help="Pin the loaded model and block swap attempts from API requests.",
     )
     parser.add_argument(
+        "--mtp",
+        action="store_true",
+        default=False,
+        help="Use native Multi-Token Prediction for speculative decoding "
+        "(requires a model with an MTP head, e.g. Qwen3.5-27B-MTP).",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1723,6 +1731,8 @@ def main():
         os.environ["PRELOAD_MODEL"] = args.model
     if args.pin_model:
         os.environ["MLX_PIN_MODEL"] = "true"
+    if args.mtp:
+        os.environ["MLX_MTP"] = "true"
     if args.adapter_path:
         os.environ["PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
