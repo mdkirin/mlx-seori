@@ -49,6 +49,9 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
+    num_experts: int = 0
 
     def __post_init__(self):
         if self.rope_parameters:

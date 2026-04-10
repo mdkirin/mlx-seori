@@ -357,6 +357,66 @@ class Qwen3_5DecoderLayer(nn.Module):
         return out
 
 
+class MTPDecoderLayer(nn.Module):
+    """Full-attention-only transformer layer for the MTP head (no GatedDeltaNet)."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.self_attn = Qwen3_5Attention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = Qwen3_5MLP(args.hidden_size, args.intermediate_size)
+
+    def __call__(
+        self,
+        x: mx.array,
+        mask: Optional[mx.array] = None,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MTPModule(nn.Module):
+    """Multi-Token Prediction head (Qwen3.5 native speculative decoding).
+
+    Predicts token t+2 from the backbone hidden state h_t and the sampled
+    token t+1, using a shared lm_head with the backbone.
+    """
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [MTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        embed_tokens: nn.Embedding,
+        cache: Optional[Any] = None,
+    ) -> mx.array:
+        embeds = embed_tokens(next_token_ids)
+        e = self.pre_fc_norm_embedding(embeds)
+        h = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(fused, cache[0])
+        for layer, c in zip(self.layers, cache):
+            fused = layer(fused, mask, c)
+
+        return self.norm(fused)
+
+
 class Qwen3_5Model(nn.Module):
     def __init__(self, args: TextConfig):
         super().__init__()
@@ -377,6 +437,7 @@ class Qwen3_5Model(nn.Module):
         mask: Optional[mx.array] = None,
         cache=None,
         position_ids: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -390,10 +451,10 @@ class Qwen3_5Model(nn.Module):
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
         for layer, c in zip(self.layers, cache):
-            mask = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, mask, c, position_ids)
+            m = ssm_mask if layer.is_linear else fa_mask
+            h = layer(h, m, c, position_ids)
 
-        return self.norm(h)
+        return h  # return pre-norm hidden for MTP
 
 
 class LanguageModel(nn.Module):
@@ -408,6 +469,8 @@ class LanguageModel(nn.Module):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if getattr(args, "mtp_num_hidden_layers", 0) > 0:
+            self.mtp = MTPModule(args)
 
     def get_rope_index(
         self,
@@ -581,6 +644,8 @@ class LanguageModel(nn.Module):
         inputs_embeds: Optional[mx.array] = None,
         mask: Optional[mx.array] = None,
         cache=None,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
         **kwargs,
     ):
         position_ids = kwargs.pop("position_ids", None)
@@ -650,24 +715,48 @@ class LanguageModel(nn.Module):
                     position_ids, (3, batch_size, seq_length)
                 )
 
-        out = self.model(
+        hidden = self.model(
             inputs,
             cache=cache,
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
+            n_confirmed=n_confirmed,
         )
+        normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
-            out = self.model.embed_tokens.as_linear(out)
+            out = self.model.embed_tokens.as_linear(normed)
         else:
-            out = self.lm_head(out)
+            out = self.lm_head(normed)
+        if return_hidden:
+            return out, hidden  # pre-norm hidden for MTP head
         return LanguageModelOutput(logits=out)
 
     @property
     def layers(self):
         return self.model.layers
 
+    def mtp_forward(
+        self,
+        hidden_states: mx.array,
+        next_token_ids: mx.array,
+        mtp_cache: Any,
+    ) -> mx.array:
+        """Run the MTP head and apply the shared lm_head."""
+        mtp_out = self.mtp(
+            hidden_states, next_token_ids, self.model.embed_tokens, mtp_cache,
+        )
+        if self.args.tie_word_embeddings:
+            return self.model.embed_tokens.as_linear(mtp_out)
+        return self.lm_head(mtp_out)
+
     def make_cache(self):
         return [ArraysCache(size=2) if l.is_linear else KVCache() for l in self.layers]
+
+    def make_mtp_cache(self):
+        """Return fresh KVCache entries for MTP layers."""
+        if hasattr(self, "mtp"):
+            return [KVCache() for _ in self.mtp.layers]
+        return []
 
     @property
     def head_dim(self):
