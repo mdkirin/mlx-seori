@@ -1513,7 +1513,7 @@ class ThinkingBudgetCriteria:
         return None
 
     def apply_forced_token(self, next_y: mx.array) -> Optional[mx.array]:
-        if self.forced_token_id is not None and self.enable_thinking:
+        if self.forced_token_id is not None:
             next_y = mx.array([self.forced_token_id])
             self.forced_token_id = None
             return next_y

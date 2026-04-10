@@ -634,6 +634,7 @@ def mtp_generate_step(
     def _apply_budget(tok_array):
         """Apply thinking budget: force </think> when budget exhausted."""
         if _tbc is not None:
+            _tbc(tok_array.item())  # track token + check budget
             return _tbc.apply_forced_token(tok_array)
         return tok_array
 
