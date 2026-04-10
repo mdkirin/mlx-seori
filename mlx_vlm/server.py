@@ -222,6 +222,27 @@ _inflight = 0
 _inflight_lock = threading.Lock()
 _last_done_ts = 0.0
 _busy_since = 0.0
+_last_request: Optional[dict] = None  # last completed inference summary
+
+
+def _record_last_request(
+    prompt_tokens: int,
+    gen_tokens: int,
+    elapsed_s: float,
+    prompt_tps: float = 0,
+    gen_tps: float = 0,
+    cached_prefix: int = 0,
+):
+    global _last_request
+    _last_request = {
+        "prompt_tokens": prompt_tokens,
+        "gen_tokens": gen_tokens,
+        "elapsed_s": round(elapsed_s, 2),
+        "prompt_tps": round(prompt_tps, 1),
+        "gen_tps": round(gen_tps, 1),
+        "cached_prefix": cached_prefix,
+        "ts": time.strftime("%H:%M:%S"),
+    }
 
 
 class FlexibleBaseModel(BaseModel):
@@ -1064,6 +1085,14 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                     )
                     yield f"event: response.completed\ndata: {ResponseCompletedEvent(type='response.completed', response=completed_response).model_dump_json()}\n\n"
 
+                    _record_last_request(
+                        prompt_tokens=usage_stats.get("input_tokens", 0),
+                        gen_tokens=usage_stats.get("output_tokens", 0),
+                        elapsed_s=time.time() - _busy_since if _busy_since else 0,
+                        prompt_tps=usage_stats.get("prompt_tps", 0),
+                        gen_tps=usage_stats.get("generation_tps", 0),
+                    )
+
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
@@ -1073,7 +1102,6 @@ async def responses_endpoint(openai_request: OpenAIRequest):
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1088,19 +1116,24 @@ async def responses_endpoint(openai_request: OpenAIRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
+                _t0_resp = time.time()
                 result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
-                    verbose=False,  # stats are passed in the response
+                    verbose=False,
                     **generation_kwargs,
                 )
-                # Clean up resources
+                _record_last_request(
+                    prompt_tokens=result.prompt_tokens,
+                    gen_tokens=result.generation_tokens,
+                    elapsed_s=time.time() - _t0_resp,
+                    prompt_tps=result.prompt_tps,
+                    gen_tps=result.generation_tps,
+                )
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
                 response = OpenAIResponse(
                     id=response_id,
@@ -1304,6 +1337,14 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
                     yield f"data: {chunk_data.model_dump_json()}\n\n"
 
+                    _record_last_request(
+                        prompt_tokens=usage_stats.get("input_tokens", 0),
+                        gen_tokens=usage_stats.get("output_tokens", 0),
+                        elapsed_s=time.time() - _busy_since if _busy_since else 0,
+                        prompt_tps=usage_stats.get("prompt_tps", 0),
+                        gen_tps=usage_stats.get("generation_tps", 0),
+                    )
+
                     yield "data: [DONE]\n\n"
 
                 except Exception as e:
@@ -1315,7 +1356,6 @@ async def chat_completions_endpoint(request: ChatRequest):
                 finally:
                     mx.clear_cache()
                     gc.collect()
-                    print("Stream finished, cleared cache.")
 
             return StreamingResponse(
                 stream_generator(),
@@ -1330,22 +1370,27 @@ async def chat_completions_endpoint(request: ChatRequest):
         else:
             # Non-streaming response
             try:
-                # Use generate from generate.py
+                _t0 = time.time()
                 gen_result = generate(
                     model=model,
                     processor=processor,
                     prompt=formatted_prompt,
                     image=images,
                     audio=audio,
-                    verbose=False,  # Keep API output clean
+                    verbose=False,
                     vision_cache=model_cache.get("vision_cache"),
                     prefix_cache=prefix_cache,
                     **generation_kwargs,
                 )
-                # Clean up resources
+                _record_last_request(
+                    prompt_tokens=gen_result.prompt_tokens,
+                    gen_tokens=gen_result.generation_tokens,
+                    elapsed_s=time.time() - _t0,
+                    prompt_tps=gen_result.prompt_tps,
+                    gen_tps=gen_result.generation_tps,
+                )
                 mx.clear_cache()
                 gc.collect()
-                print("Generation finished, cleared cache.")
 
                 usage_stats = UsageStats(
                     input_tokens=gen_result.prompt_tokens,
@@ -1474,7 +1519,7 @@ async def server_status():
     idle_sec = round(now - last_done, 1) if last_done > 0 else None
     busy_sec = round(now - busy_start, 1) if busy and busy_start > 0 else None
 
-    return {
+    result = {
         "busy": busy,
         "inflight": inflight,
         "idle_seconds": idle_sec,
@@ -1489,6 +1534,9 @@ async def server_status():
         },
         "prompt_cache": prefix_cache.stats(),
     }
+    if _last_request is not None:
+        result["last_request"] = _last_request
+    return result
 
 
 @app.post("/v1/warmup")
