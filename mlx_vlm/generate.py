@@ -508,6 +508,7 @@ def mtp_generate_step(
     kv_bits: Optional[int] = None,
     kv_group_size: int = 64,
     quantized_kv_start: int = 0,
+    thinking_budget_criteria=None,
     **_kwargs,
 ) -> Generator[Tuple[mx.array, mx.array, bool], None, None]:
     """MTP (Multi-Token Prediction) speculative decoding for VLM models.
@@ -628,12 +629,20 @@ def mtp_generate_step(
 
     ntoks = 0
     draft_tok = draft_lp = None
+    _tbc = thinking_budget_criteria  # thinking token budget enforcer
+
+    def _apply_budget(tok_array):
+        """Apply thinking budget: force </think> when budget exhausted."""
+        if _tbc is not None:
+            return _tbc.apply_forced_token(tok_array)
+        return tok_array
 
     while ntoks < max_tokens:
         if draft_tok is None:
             toks, lps, hidden = _step_backbone(y, n_predict=1)
-            mx.eval(toks)
-            main_tok, main_lp = toks[0], lps[0]
+            main_tok = _apply_budget(toks[0])
+            mx.eval(main_tok)
+            main_lp = lps[0]
             ntoks += 1
             yield main_tok.item(), main_lp, False
             if ntoks >= max_tokens:
@@ -658,25 +667,31 @@ def mtp_generate_step(
 
             if accept:
                 _clear_rollback()
+                draft_out = _apply_budget(mx.array([draft_tok_id], mx.uint32))
+                mx.eval(draft_out)
                 ntoks += 1
-                yield draft_tok_id, draft_lp, True
+                yield draft_out.item(), draft_lp, True
                 if ntoks >= max_tokens:
                     return
+                bonus_out = _apply_budget(bonus_tok)
+                mx.eval(bonus_out)
                 ntoks += 1
-                yield bonus_tok.item(), bonus_lp, False
+                yield bonus_out.item(), bonus_lp, False
                 if ntoks >= max_tokens:
                     return
-                draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_tok)
+                draft_tok, draft_lp = _step_mtp(hidden[:, 1:2, :], bonus_out)
                 mx.eval(draft_tok)
-                y = mx.array([bonus_tok.item()], mx.uint32)
+                y = mx.array([bonus_out.item()], mx.uint32)
             else:
                 _rollback_draft()
-                verify_tok_id = verify_pred.item()
+                verify_out = _apply_budget(verify_pred)
+                mx.eval(verify_out)
+                verify_tok_id = verify_out.item()
                 ntoks += 1
                 yield verify_tok_id, verify_lp, False
                 if ntoks >= max_tokens:
                     return
-                draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_pred)
+                draft_tok, draft_lp = _step_mtp(hidden[:, 0:1, :], verify_out)
                 mx.eval(draft_tok)
                 y = mx.array([verify_tok_id], mx.uint32)
 
@@ -1063,6 +1078,7 @@ def stream_generate(
 
         _sampler = _make_sampler(temp=_temp, top_p=_top_p, min_p=_min_p, top_k=_top_k) if _temp > 0 else None
         _processors = _make_lp(_logit_bias, _rep_penalty, _rep_ctx)
+        _think_criteria = kwargs.pop("thinking_budget_criteria", None)
 
         total_prompt_tokens = reused_prefix_len + input_ids.size
         tracked_cache = _prompt_cache
@@ -1078,6 +1094,7 @@ def stream_generate(
             kv_bits=_kv_bits,
             kv_group_size=_kv_group,
             quantized_kv_start=_kv_qstart,
+            thinking_budget_criteria=_think_criteria,
         )
 
         with wired_limit(model, [generation_stream]):

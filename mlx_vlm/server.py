@@ -249,10 +249,15 @@ def _record_last_request(
 
 # ── Request logger (JSONL) ──────────────────────────────────
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+# 일부 모델(122B MoE)은 <think> 태그 없이 "Thinking Process:" plain text로 thinking 출력
+_PLAIN_THINK_RE = re.compile(
+    r"^(?:Thinking Process:.*?)(?=\n(?:##|\*\*|[A-Z가-힣])|$)",
+    re.DOTALL,
+)
 
 
 def _strip_thinking(text: str) -> str:
-    """Remove <think>…</think> blocks and residual thinking preamble."""
+    """Remove <think>…</think> blocks and plain-text thinking preamble."""
     if not text:
         return text
     # 1) 완전한 <think>...</think> 태그
@@ -263,6 +268,24 @@ def _strip_thinking(text: str) -> str:
     # 3) 열린 <think> 태그가 남아있으면 제거
     if "<think>" in result:
         result = result.split("<think>", 1)[0]
+    # 4) Plain text thinking (태그 없이 "Thinking Process:" 로 시작)
+    if result.lstrip().startswith("Thinking Process:"):
+        # 아직 실제 답변이 안 나왔으면 전체가 thinking — 빈 문자열 반환
+        # 실제 답변이 나왔으면 thinking 부분 제거
+        lines = result.split("\n")
+        answer_start = None
+        for i, line in enumerate(lines):
+            stripped = line.strip()
+            # 빈 줄이 아니고, 번호 매기기/인덴트가 아닌 실제 답변 시작 감지
+            if stripped and not stripped.startswith(("Thinking", "*", "-", "1.", "2.", "3.", "4.", "5.", "6.", "7.", "8.", "9.")):
+                # 마크다운 헤더나 실제 내용인지 확인
+                if stripped.startswith(("#", "##")) or (len(stripped) > 5 and not stripped[0].isdigit()):
+                    answer_start = i
+                    break
+        if answer_start is not None:
+            result = "\n".join(lines[answer_start:])
+        else:
+            result = ""  # 아직 thinking만 — 빈 문자열
     return result.strip()
 
 
