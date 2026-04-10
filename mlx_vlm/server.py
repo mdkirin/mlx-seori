@@ -46,6 +46,38 @@ DEFAULT_SERVER_HOST = "0.0.0.0"
 DEFAULT_SERVER_PORT = 8080
 
 
+# ── Metal memory limits ──────────────────────────────────────
+# Set via environment variables or CLI args (see main()).
+# Without limits the MLX cache can consume all unified memory.
+
+def _configure_metal_limits():
+    """Apply Metal memory/cache limits from environment variables.
+
+    Environment variables:
+        MLX_MEMORY_LIMIT_GB: Hard limit on total Metal memory (default: 87.5% of total)
+        MLX_CACHE_LIMIT_GB: Metal cache limit (default: total_limit // 7, min 4GB)
+    """
+    try:
+        total_gb = mx.device_info().get("memory_size", 96 * 1024**3) / 1024**3
+    except AttributeError:
+        total_gb = mx.metal.device_info().get("memory_size", 96 * 1024**3) / 1024**3
+
+    mem_limit = int(os.environ.get("MLX_MEMORY_LIMIT_GB", 0)) or int(total_gb * 0.875)
+    cache_limit = int(os.environ.get("MLX_CACHE_LIMIT_GB", 0)) or max(4, mem_limit // 7)
+
+    try:
+        mx.set_memory_limit(mem_limit * 1024**3)
+        mx.set_cache_limit(cache_limit * 1024**3)
+    except AttributeError:
+        mx.metal.set_memory_limit(mem_limit * 1024**3)
+        mx.metal.set_cache_limit(cache_limit * 1024**3)
+
+    print(f"Metal limits: memory={mem_limit}GB, cache={cache_limit}GB (hardware={total_gb:.0f}GB)")
+    return mem_limit, cache_limit
+
+_metal_mem_limit_gb, _metal_cache_limit_gb = _configure_metal_limits()
+
+
 def get_prefill_step_size():
     return int(os.environ.get("PREFILL_STEP_SIZE", DEFAULT_PREFILL_STEP_SIZE))
 
@@ -1367,6 +1399,8 @@ async def server_status():
         "active_mb": round(active / 1e6, 1),
         "cache_mb": round(cache_mem / 1e6, 1),
         "peak_mb": round(peak / 1e6, 1),
+        "limit_gb": _metal_mem_limit_gb,
+        "cache_limit_gb": _metal_cache_limit_gb,
     }
 
     return {
