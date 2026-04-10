@@ -127,6 +127,10 @@ async def lifespan(app):
         try:
             print(f"Preloading model: {model_path}")
             get_cached_model(model_path, adapter_path)
+            # Pin model: block swaps from API requests
+            if os.environ.get("MLX_PIN_MODEL", "").lower() in ("1", "true"):
+                _pinned_models.add(model_path)
+                print(f"Model pinned: {model_path}")
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
@@ -135,8 +139,8 @@ async def lifespan(app):
 
 
 app = FastAPI(
-    title="MLX-VLM Inference API",
-    description="API for using Vision Language Models (VLMs) and Omni Models (Vision, Audio and Video support) with MLX.",
+    title="MLX-Seori Inference API",
+    description="MLX VLM server with PrefixCache, Metal memory management, and inference tracking.",
     version=__version__,
     lifespan=lifespan,
 )
@@ -149,12 +153,75 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── Inference tracking + GC middleware ────────────────────────
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request as StarletteRequest
+
+_gc_threshold_mb = _metal_mem_limit_gb * 0.75 * 1024
+
+
+def _get_active_mb() -> float:
+    try:
+        return mx.get_active_memory() / 1e6
+    except AttributeError:
+        return mx.metal.get_active_memory() / 1e6
+
+
+class InferenceTrackingMiddleware(BaseHTTPMiddleware):
+    """Track inflight inference requests and trigger GC on memory pressure."""
+
+    async def dispatch(self, request: StarletteRequest, call_next):
+        global _inflight, _last_done_ts, _busy_since
+
+        path = request.url.path
+        is_inference = "chat/completions" in path or "/responses" in path
+
+        if is_inference:
+            with _inflight_lock:
+                if _inflight == 0:
+                    _busy_since = time.time()
+                _inflight += 1
+
+        try:
+            return await call_next(request)
+        finally:
+            if is_inference:
+                with _inflight_lock:
+                    _inflight -= 1
+                    _last_done_ts = time.time()
+
+                active = _get_active_mb()
+                if active > _gc_threshold_mb:
+                    gc.collect()
+                    try:
+                        mx.clear_cache()
+                    except AttributeError:
+                        mx.metal.clear_cache()
+                    print(
+                        f"GC triggered (active={active:.0f}MB > "
+                        f"{_gc_threshold_mb:.0f}MB threshold)"
+                    )
+
+
+app.add_middleware(InferenceTrackingMiddleware)
+
 MAX_IMAGES = 10  # Maximum number of images to process at once
 
 # Loading/unloading utilities
 
 model_cache = {}
 prefix_cache = PrefixCache()
+_pinned_models: set = set()  # Models that cannot be swapped by API requests
+
+
+# ── Inference tracking ───────────────────────────────────────
+import threading
+
+_inflight = 0
+_inflight_lock = threading.Lock()
+_last_done_ts = 0.0
+_busy_since = 0.0
 
 
 class FlexibleBaseModel(BaseModel):
@@ -201,7 +268,12 @@ def get_cached_model(model_path: str, adapter_path: Optional[str] = None):
 
     # Return from cache if already loaded and matches the requested paths
     if model_cache.get("cache_key") == cache_key:
-        print(f"Using cached model: {model_path}, Adapter: {adapter_path}")
+        return model_cache["model"], model_cache["processor"], model_cache["config"]
+
+    # If a pinned model is loaded, block swap attempts
+    loaded_path = model_cache.get("model_path")
+    if loaded_path and loaded_path in _pinned_models and model_path != loaded_path:
+        print(f"Model swap blocked: {model_path} → using pinned {loaded_path}")
         return model_cache["model"], model_cache["processor"], model_cache["config"]
 
     # If cache exists but doesn't match, clear it
@@ -1382,11 +1454,7 @@ async def health_check():
 
 @app.get("/v1/status")
 async def server_status():
-    """Return detailed server status: memory, model, and prefix cache stats.
-
-    Designed for monitoring dashboards and health probes.
-    """
-    mem_info = {}
+    """Return detailed server status: busy, memory, model, and prefix cache stats."""
     try:
         active = mx.get_active_memory()
         cache_mem = mx.get_cache_memory()
@@ -1395,19 +1463,30 @@ async def server_status():
         active = mx.metal.get_active_memory()
         cache_mem = mx.metal.get_cache_memory()
         peak = mx.metal.get_peak_memory()
-    mem_info = {
-        "active_mb": round(active / 1e6, 1),
-        "cache_mb": round(cache_mem / 1e6, 1),
-        "peak_mb": round(peak / 1e6, 1),
-        "limit_gb": _metal_mem_limit_gb,
-        "cache_limit_gb": _metal_cache_limit_gb,
-    }
+
+    with _inflight_lock:
+        busy = _inflight > 0
+        inflight = _inflight
+        last_done = _last_done_ts
+        busy_start = _busy_since
+
+    now = time.time()
+    idle_sec = round(now - last_done, 1) if last_done > 0 else None
+    busy_sec = round(now - busy_start, 1) if busy and busy_start > 0 else None
 
     return {
-        "status": "healthy",
+        "busy": busy,
+        "inflight": inflight,
+        "idle_seconds": idle_sec,
+        "busy_seconds": busy_sec,
         "model": model_cache.get("model_path", None),
-        "adapter": model_cache.get("adapter_path", None),
-        "memory": mem_info,
+        "memory": {
+            "active_mb": round(active / 1e6, 1),
+            "cache_mb": round(cache_mem / 1e6, 1),
+            "peak_mb": round(peak / 1e6, 1),
+            "limit_gb": _metal_mem_limit_gb,
+            "cache_limit_gb": _metal_cache_limit_gb,
+        },
         "prompt_cache": prefix_cache.stats(),
     }
 
@@ -1576,6 +1655,12 @@ def main():
         help="Start index (of token) for the quantized KV cache.",
     )
     parser.add_argument(
+        "--pin-model",
+        action="store_true",
+        default=False,
+        help="Pin the loaded model and block swap attempts from API requests.",
+    )
+    parser.add_argument(
         "--reload",
         action="store_true",
         default=False,
@@ -1588,6 +1673,8 @@ def main():
         os.environ["MLX_TRUST_REMOTE_CODE"] = "true"
     if args.model:
         os.environ["PRELOAD_MODEL"] = args.model
+    if args.pin_model:
+        os.environ["MLX_PIN_MODEL"] = "true"
     if args.adapter_path:
         os.environ["PRELOAD_ADAPTER"] = args.adapter_path
     os.environ["PREFILL_STEP_SIZE"] = str(args.prefill_step_size)
