@@ -567,7 +567,10 @@ def mtp_generate_step(
                 c.rollback_state = None
             elif c.is_trimmable():
                 c.trim(1)
-        cache.trim_prompt_cache(mtp_cache, 1)
+        # MTP cache는 KVCache만 사용 (full attention) → trim 가능
+        for c in mtp_cache:
+            if hasattr(c, "trim"):
+                c.trim(1)
 
     def _step_backbone(y, n_predict=1, n_confirmed=0):
         with mx.stream(generation_stream):
