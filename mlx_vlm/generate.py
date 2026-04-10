@@ -548,8 +548,14 @@ def mtp_generate_step(
 
     def _process_and_sample(tokens, logits):
         if logits_processors:
+            # logits_processors expect 2D (batch, vocab); MTP passes 1D after squeeze
+            squeezed = logits.ndim == 1
+            if squeezed:
+                logits = logits[None, :]
             for processor in logits_processors:
                 logits = processor(tokens, logits)
+            if squeezed:
+                logits = logits.squeeze(0)
         logprobs = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
         return sampler(logprobs), logprobs
 
