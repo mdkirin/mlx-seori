@@ -8,6 +8,7 @@ from .generate import (
     BatchResponse,
     BatchStats,
     GenerationResult,
+    PrefixCache,
     PromptCacheState,
     batch_generate,
     generate,

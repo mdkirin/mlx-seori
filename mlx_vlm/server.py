@@ -31,6 +31,7 @@ from .generate import (
     DEFAULT_THINKING_END_TOKEN,
     DEFAULT_THINKING_START_TOKEN,
     DEFAULT_TOP_P,
+    PrefixCache,
     generate,
     normalize_resize_shape,
     stream_generate,
@@ -121,6 +122,7 @@ MAX_IMAGES = 10  # Maximum number of images to process at once
 # Loading/unloading utilities
 
 model_cache = {}
+prefix_cache = PrefixCache()
 
 
 class FlexibleBaseModel(BaseModel):
@@ -1128,6 +1130,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                         image=images,
                         audio=audio,
                         vision_cache=model_cache.get("vision_cache"),
+                        prefix_cache=prefix_cache,
                         **generation_kwargs,
                     )
 
@@ -1232,6 +1235,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     audio=audio,
                     verbose=False,  # Keep API output clean
                     vision_cache=model_cache.get("vision_cache"),
+                    prefix_cache=prefix_cache,
                     **generation_kwargs,
                 )
                 # Clean up resources
@@ -1342,6 +1346,80 @@ async def health_check():
         "loaded_model": model_cache.get("model_path", None),
         "loaded_adapter": model_cache.get("adapter_path", None),
     }
+
+
+@app.post("/v1/warmup")
+async def warmup_endpoint(request: dict):
+    """Prefill a system prompt and cache the KV/SSM state for TTFT optimization.
+
+    This is particularly useful for hybrid models (e.g. Qwen3.5 with
+    Attention + Mamba layers) where mlx-lm's LRUPromptCache is broken.
+
+    Request body::
+
+        {
+            "messages": [{"role": "system", "content": "..."}],
+            "tools": [...]  // optional
+        }
+
+    The stable prefix (tokens shared across different user messages) is
+    detected automatically by comparing two prompt variants.  Subsequent
+    ``/v1/chat/completions`` requests whose token sequence starts with
+    the cached prefix will skip the prefix prefill entirely.
+    """
+    try:
+        model, processor, config = get_cached_model(
+            model_cache.get("model_path", request.get("model", ""))
+        )
+        messages = request.get("messages", [])
+        tools = request.get("tools")
+        template_kwargs = {}
+        if tools:
+            template_kwargs["tools"] = tools
+
+        # Detect stable prefix by comparing two variants with different user messages
+        system_msgs = [m for m in messages if m.get("role") == "system"]
+        if not system_msgs:
+            return {"success": False, "error": "no system messages found"}
+
+        tokenizer = processor.tokenizer if hasattr(processor, "tokenizer") else processor
+
+        variant_a = system_msgs + [{"role": "user", "content": "\u03b1"}]
+        variant_b = system_msgs + [{"role": "user", "content": "\u03b2 \u03b3 \u03b4 \u03b5 \u03b6 \u03b7 \u03b8 \u03b9 \u03ba \u03bb"}]
+
+        prompt_a = apply_chat_template(processor, config, variant_a, **template_kwargs)
+        prompt_b = apply_chat_template(processor, config, variant_b, **template_kwargs)
+
+        tokens_a = tokenizer.encode(prompt_a)
+        tokens_b = tokenizer.encode(prompt_b)
+
+        plen = 0
+        for a, b in zip(tokens_a, tokens_b):
+            if a == b:
+                plen += 1
+            else:
+                break
+
+        if plen < 20:
+            return {"success": False, "error": f"prefix too short ({plen} tokens)"}
+
+        prefix_tokens = tokens_a[:plen]
+        prefix_cache.warmup(model, prefix_tokens)
+
+        return {
+            "success": True,
+            "prefix_tokens": plen,
+            "warmup_ms": prefix_cache.last_warmup_ms,
+        }
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/v1/prefix_cache/stats")
+async def prefix_cache_stats():
+    """Return prefix cache hit/miss statistics."""
+    return prefix_cache.stats()
 
 
 @app.post("/unload")

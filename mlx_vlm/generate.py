@@ -371,6 +371,131 @@ class PromptCacheState:
         self.cache = kv_cache
 
 
+class PrefixCache:
+    """Server-level prefix cache for system prompt KV/Mamba state reuse.
+
+    Unlike PromptCacheState (designed for multi-turn chat), PrefixCache
+    stores a clean checkpoint of a fixed prefix (e.g. system prompt) and
+    provides a deepcopy on each request.  This works correctly with hybrid
+    architectures (Attention + Mamba/GatedDeltaNet) like Qwen3.5 where
+    mlx-lm's LRUPromptCache fails (ml-explore/mlx-lm#980).
+
+    Usage::
+
+        prefix_cache = PrefixCache()
+
+        # At startup: prefill and save system prompt state
+        prefix_cache.warmup(model, processor, system_messages)
+
+        # Per request: get cached state + remaining tokens
+        cached, remaining, prefix_len = prefix_cache.try_restore(full_token_ids)
+        if cached is not None:
+            # pass remaining tokens + cached state to generate_step
+            ...
+
+    The warmup can also be triggered via the /v1/warmup server endpoint.
+    If no explicit warmup is performed, the first text-only request
+    triggers automatic prefix detection and warmup (lazy warmup).
+    """
+
+    def __init__(self):
+        self._prefix_tokens: Optional[List[int]] = None
+        self._prefix_cache: Optional[List[Any]] = None
+        self._prefix_len: int = 0
+        self.hits: int = 0
+        self.misses: int = 0
+        self.warmups: int = 0
+        self.last_warmup_ms: float = 0
+
+    @property
+    def is_ready(self) -> bool:
+        return self._prefix_cache is not None
+
+    def warmup(
+        self,
+        model: nn.Module,
+        prefix_tokens: List[int],
+        prefill_step_size: int = DEFAULT_PREFILL_STEP_SIZE,
+    ):
+        """Prefill *prefix_tokens* through the model and save the cache.
+
+        The saved cache is a clean snapshot containing **only** the prefix
+        state (no generated tokens), so it can be deepcopied and reused
+        for any request that starts with the same prefix.
+        """
+        import copy as _copy
+
+        t0 = time.perf_counter()
+        kv_cache = cache.make_prompt_cache(model.language_model)
+        input_ids = mx.array([prefix_tokens])
+
+        # Text-only embedding (no vision)
+        embed_out = model.get_input_embeddings(input_ids, None)
+        inputs_embeds = embed_out.inputs_embeds
+
+        # Chunked prefill
+        total = inputs_embeds.shape[1]
+        pos = 0
+        while pos < total:
+            n = min(prefill_step_size, total - pos)
+            model.language_model(
+                input_ids[:, pos : pos + n],
+                inputs_embeds=inputs_embeds[:, pos : pos + n],
+                cache=kv_cache,
+            )
+            mx.eval([c.state for c in kv_cache])
+            pos += n
+            if pos < total:
+                mx.clear_cache()
+
+        self._prefix_cache = kv_cache
+        self._prefix_tokens = list(prefix_tokens)
+        self._prefix_len = len(prefix_tokens)
+        self.warmups += 1
+        self.last_warmup_ms = (time.perf_counter() - t0) * 1000
+
+    def try_restore(
+        self, full_tokens: List[int]
+    ) -> Tuple[Optional[List[Any]], List[int], int]:
+        """If *full_tokens* starts with the cached prefix, return
+        ``(cache_copy, remaining_tokens, prefix_len)``.
+        Otherwise return ``(None, full_tokens, 0)``.
+        """
+        import copy as _copy
+
+        if self._prefix_tokens is None:
+            return None, full_tokens, 0
+
+        plen = self._prefix_len
+        if len(full_tokens) <= plen:
+            self.misses += 1
+            return None, full_tokens, 0
+
+        if full_tokens[:plen] != self._prefix_tokens:
+            self.misses += 1
+            return None, full_tokens, 0
+
+        self.hits += 1
+        return _copy.deepcopy(self._prefix_cache), full_tokens[plen:], plen
+
+    def invalidate(self):
+        self._prefix_cache = None
+        self._prefix_tokens = None
+        self._prefix_len = 0
+
+    def stats(self) -> dict:
+        total = self.hits + self.misses
+        return {
+            "ready": self.is_ready,
+            "prefix_tokens": self._prefix_len,
+            "hits": self.hits,
+            "misses": self.misses,
+            "hit_rate": round(self.hits / total, 3) if total > 0 else 0,
+            "warmups": self.warmups,
+            "last_warmup_ms": round(self.last_warmup_ms, 1),
+        }
+
+
 def generate_step(
     input_ids: mx.array,
     model: nn.Module,
@@ -665,6 +790,7 @@ def stream_generate(
 
     # Prompt cache reuse: skip common prefix from previous turn
     prompt_cache_state = kwargs.pop("prompt_cache_state", None)
+    prefix_cache: Optional[PrefixCache] = kwargs.pop("prefix_cache", None)
     reused_prefix_len = 0
     full_input_ids_list = input_ids.flatten().tolist()
 
@@ -695,6 +821,18 @@ def stream_generate(
                         if hasattr(c, "offset"):
                             c.offset = prefix_len
             kwargs["prompt_cache"] = kv_cache
+
+    # Server-level prefix cache: deepcopy-based, safe for hybrid models
+    elif prefix_cache is not None and prefix_cache.is_ready:
+        has_media = bool(image) or bool(audio) or pixel_values is not None
+        if not has_media:
+            cached, remaining, plen = prefix_cache.try_restore(full_input_ids_list)
+            if cached is not None:
+                reused_prefix_len = plen
+                input_ids = mx.array([remaining])
+                pixel_values = None
+                kwargs.pop("cached_image_features", None)
+                kwargs["prompt_cache"] = cached
 
     if thinking_budget is not None:
         thinking_start_token_id = tokenizer.encode(
