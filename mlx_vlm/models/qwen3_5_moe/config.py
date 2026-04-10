@@ -52,6 +52,9 @@ class TextConfig(BaseModelConfig):
         }
     )
     full_attention_interval: int = 4
+    intermediate_size: int = 0  # MTP dense MLP 폴백용
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
 
     def __post_init__(self):
         if self.rope_parameters:

@@ -4,7 +4,10 @@ import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm.models.switch_layers import SwitchGLU
 
+from ..base import LanguageModelOutput, create_attention_mask
+from ..cache import KVCache
 from ..qwen3_5.language import LanguageModel as Qwen3_5LanguageModel
+from ..qwen3_5.language import MTPModule as Qwen3_5MTPModule
 from ..qwen3_5.language import Qwen3_5Attention as Qwen3_5MoeAttention
 from ..qwen3_5.language import Qwen3_5GatedDeltaNet as Qwen3_5MoeGatedDeltaNet
 from ..qwen3_5.language import Qwen3_5MLP as Qwen3_5MoeMLP
@@ -47,6 +50,49 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         shared_y = mx.sigmoid(self.shared_expert_gate(x)) * shared_y
 
         return y + shared_y
+
+
+class MoeMTPDecoderLayer(nn.Module):
+    """MTP decoder layer with MoE MLP (no GatedDeltaNet)."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.self_attn = Qwen3_5MoeAttention(args)
+        self.input_layernorm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.post_attention_layernorm = nn.RMSNorm(
+            args.hidden_size, eps=args.rms_norm_eps
+        )
+        self.mlp = Qwen3_5MoeSparseMoeBlock(args)
+
+    def __call__(self, x, mask=None, cache=None) -> mx.array:
+        r = self.self_attn(self.input_layernorm(x), mask, cache)
+        h = x + r
+        return h + self.mlp(self.post_attention_layernorm(h))
+
+
+class MoeMTPModule(nn.Module):
+    """MTP head for MoE models — uses SparseMoeBlock instead of dense MLP."""
+
+    def __init__(self, args: TextConfig):
+        super().__init__()
+        self.pre_fc_norm_hidden = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.pre_fc_norm_embedding = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+        self.fc = nn.Linear(args.hidden_size * 2, args.hidden_size, bias=False)
+        self.layers = [MoeMTPDecoderLayer(args) for _ in range(args.mtp_num_hidden_layers)]
+        self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
+
+    def __call__(self, hidden_states, next_token_ids, embed_tokens, cache=None):
+        embeds = embed_tokens(next_token_ids)
+        e = self.pre_fc_norm_embedding(embeds)
+        h = self.pre_fc_norm_hidden(hidden_states)
+        fused = self.fc(mx.concatenate([e, h], axis=-1))
+
+        if cache is None:
+            cache = [None] * len(self.layers)
+        mask = create_attention_mask(fused, cache[0])
+        for layer, c in zip(self.layers, cache):
+            fused = layer(fused, mask, c)
+        return self.norm(fused)
 
 
 class Qwen3_5MoeDecoderLayer(nn.Module):
@@ -108,3 +154,10 @@ class LanguageModel(Qwen3_5LanguageModel):
 
         if not args.tie_word_embeddings:
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
+        if getattr(args, "mtp_num_hidden_layers", 0) > 0:
+            self.mtp = MoeMTPModule(args)
+
+    def make_mtp_cache(self):
+        if hasattr(self, "mtp"):
+            return [KVCache() for _ in self.mtp.layers]
+        return []
