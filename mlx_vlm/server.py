@@ -1354,39 +1354,34 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
-                    # ── Thinking 필터 (스트리밍) ──
-                    # enable_thinking=false 시: <think>...</think> 블록을 버퍼링하고
-                    # </think> 이후 실제 답변만 emit
-                    _tf_buf = ""       # thinking 버퍼
-                    _tf_active = _should_strip_thinking  # 필터 활성
-                    _tf_in_think = False
+                    usage_stats = {}
+                    usage_stats = {}
+                    _tf_emitted = 0  # thinking strip: emit한 바이트 수
+                    _tf_raw = ""     # 전체 raw 텍스트
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
-                        chunk_text = chunk.text
-                        if _tf_active:
-                            _tf_buf += chunk_text
-                            if not _tf_in_think:
-                                if "<think>" in _tf_buf:
-                                    _tf_in_think = True
-                                elif len(_tf_buf) > 50:
-                                    # thinking 없는 응답 → 버퍼 플러시
-                                    _tf_active = False
-                                    chunk_text = _tf_buf
-                                else:
-                                    continue  # 버퍼링 중
-                            if _tf_in_think:
-                                if "</think>" in _tf_buf:
-                                    # thinking 끝 → 실제 답변 시작
-                                    _tf_active = False
-                                    chunk_text = _tf_buf.split("</think>", 1)[-1].lstrip("\n")
-                                    _tf_buf = ""
-                                else:
-                                    continue  # thinking 중 → suppress
-                            if _tf_active:
+                        usage_stats = {
+                            "input_tokens": chunk.prompt_tokens,
+                            "output_tokens": chunk.generation_tokens,
+                            "total_tokens": chunk.prompt_tokens
+                            + chunk.generation_tokens,
+                            "prompt_tps": chunk.prompt_tps,
+                            "generation_tps": chunk.generation_tps,
+                            "peak_memory": chunk.peak_memory,
+                        }
+
+                        if _should_strip_thinking:
+                            _tf_raw += chunk.text
+                            clean = _strip_thinking(_tf_raw)
+                            chunk_text = clean[_tf_emitted:]
+                            if not chunk_text:
                                 continue
+                            _tf_emitted = len(clean)
+                        else:
+                            chunk_text = chunk.text
 
                         output_text += chunk_text
 
