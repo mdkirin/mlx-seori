@@ -320,7 +320,7 @@ python -m mlx_vlm.convert --hf-path <local_dir> --mlx-path <mlx_dir>
             )
         model = quantize_activations(model)
 
-    model.load_weights(list(weights.items()))
+    model.load_weights(list(weights.items()), strict=False)
 
     if not lazy:
         mx.eval(model.parameters())
