@@ -1,6 +1,8 @@
 import argparse
 import gc
 import json
+import logging
+import logging.handlers
 import os
 import re
 import time
@@ -243,6 +245,65 @@ def _record_last_request(
         "cached_prefix": cached_prefix,
         "ts": time.strftime("%H:%M:%S"),
     }
+
+
+# ── Request logger (JSONL) ──────────────────────────────────
+_req_logger: Optional[logging.Logger] = None
+
+
+def _init_request_logger():
+    """Lazy-init a file logger that writes to /tmp/mlx_requests.jsonl."""
+    global _req_logger
+    if _req_logger is not None:
+        return
+    _req_logger = logging.getLogger("mlx_vlm.requests")
+    _req_logger.setLevel(logging.INFO)
+    _req_logger.propagate = False
+    handler = logging.handlers.RotatingFileHandler(
+        "/tmp/mlx_requests.jsonl",
+        maxBytes=50 * 1024 * 1024,  # 50MB
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    _req_logger.addHandler(handler)
+
+
+def _log_request(
+    messages: list,
+    *,
+    prompt_tokens: int = 0,
+    gen_tokens: int = 0,
+    elapsed_s: float = 0,
+    gen_tps: float = 0,
+    error: str = "",
+    stream: bool = False,
+    mtp: bool = False,
+):
+    """Log a single request as one JSONL line."""
+    _init_request_logger()
+    # Summarise messages: role + first 200 chars of content
+    msgs_summary = []
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content", "")
+        if len(content) > 200:
+            content = content[:200] + f"…({len(content)}ch)"
+        msgs_summary.append({"role": role, "content": content})
+
+    entry = {
+        "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "messages": msgs_summary,
+        "prompt_tokens": prompt_tokens,
+        "gen_tokens": gen_tokens,
+        "elapsed_s": round(elapsed_s, 2),
+        "gen_tps": round(gen_tps, 1),
+        "stream": stream,
+        "mtp": mtp,
+    }
+    if error:
+        entry["error"] = error
+    _req_logger.info(json.dumps(entry, ensure_ascii=False))
 
 
 class FlexibleBaseModel(BaseModel):
@@ -1338,12 +1399,22 @@ async def chat_completions_endpoint(request: ChatRequest):
                     )
                     yield f"data: {chunk_data.model_dump_json(exclude_none=True)}\n\n"
 
+                    _elapsed = time.time() - _busy_since if _busy_since else 0
                     _record_last_request(
                         prompt_tokens=usage_stats.get("input_tokens", 0),
                         gen_tokens=usage_stats.get("output_tokens", 0),
-                        elapsed_s=time.time() - _busy_since if _busy_since else 0,
+                        elapsed_s=_elapsed,
                         prompt_tps=usage_stats.get("prompt_tps", 0),
                         gen_tps=usage_stats.get("generation_tps", 0),
+                    )
+                    _log_request(
+                        processed_messages,
+                        prompt_tokens=usage_stats.get("input_tokens", 0),
+                        gen_tokens=usage_stats.get("output_tokens", 0),
+                        elapsed_s=_elapsed,
+                        gen_tps=usage_stats.get("generation_tps", 0),
+                        stream=True,
+                        mtp=os.environ.get("MLX_MTP", "").lower() in ("1", "true"),
                     )
 
                     yield "data: [DONE]\n\n"
@@ -1351,6 +1422,9 @@ async def chat_completions_endpoint(request: ChatRequest):
                 except Exception as e:
                     print(f"Error during stream generation: {e}")
                     traceback.print_exc()
+                    _log_request(
+                        processed_messages, stream=True, error=str(e),
+                    )
                     error_data = json.dumps({"error": str(e)})
                     yield f"data: {error_data}\n\n"
 
@@ -1383,12 +1457,21 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prefix_cache=prefix_cache,
                     **generation_kwargs,
                 )
+                _elapsed = time.time() - _t0
                 _record_last_request(
                     prompt_tokens=gen_result.prompt_tokens,
                     gen_tokens=gen_result.generation_tokens,
-                    elapsed_s=time.time() - _t0,
+                    elapsed_s=_elapsed,
                     prompt_tps=gen_result.prompt_tps,
                     gen_tps=gen_result.generation_tps,
+                )
+                _log_request(
+                    processed_messages,
+                    prompt_tokens=gen_result.prompt_tokens,
+                    gen_tokens=gen_result.generation_tokens,
+                    elapsed_s=_elapsed,
+                    gen_tps=gen_result.generation_tps,
+                    stream=False,
                 )
                 mx.clear_cache()
                 gc.collect()
@@ -1433,6 +1516,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             except Exception as e:
                 print(f"Error during generation: {e}")
                 traceback.print_exc()
+                _log_request(processed_messages, stream=False, error=str(e))
                 mx.clear_cache()
                 gc.collect()
                 raise HTTPException(status_code=500, detail=f"Generation failed: {e}")

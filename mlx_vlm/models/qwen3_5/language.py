@@ -251,15 +251,57 @@ class Qwen3_5GatedDeltaNet(nn.Module):
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
 
+    def _process_chunk(
+        self,
+        qkv_chunk: mx.array,
+        a_chunk: mx.array,
+        b_chunk: mx.array,
+        conv_state: mx.array,
+        ssm_state: Optional[mx.array],
+        ssm_mask: Optional[mx.array] = None,
+    ):
+        B, S_chunk = qkv_chunk.shape[:2]
+        conv_in = mx.concatenate([conv_state, qkv_chunk], axis=1)
+        n_keep = self.conv_kernel_size - 1
+        new_conv_state = mx.contiguous(conv_in[:, -n_keep:])
+        conv_out = nn.silu(self.conv1d(conv_in))
+
+        q, k, v = [
+            t.reshape(B, S_chunk, h, d)
+            for t, h, d in zip(
+                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
+                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
+                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+            )
+        ]
+        inv_scale = k.shape[-1] ** -0.5
+        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
+        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
+
+        out, new_ssm_state = gated_delta_update(
+            q,
+            k,
+            v,
+            a_chunk,
+            b_chunk,
+            self.A_log,
+            self.dt_bias,
+            ssm_state,
+            ssm_mask,
+            use_kernel=not self.training,
+        )
+        return out, new_conv_state, new_ssm_state
+
     def __call__(
         self,
         inputs: mx.array,
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
-        mixed_qkv = self.in_proj_qkv(inputs)
+        qkv = self.in_proj_qkv(inputs)
 
         z = self.in_proj_z(inputs)
         z = z.reshape(B, S, -1, self.head_v_dim)
@@ -279,48 +321,48 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 (B, self.conv_kernel_size - 1, self.conv_dim),
                 dtype=inputs.dtype,
             )
+        ssm_state = cache[1] if cache else None
+        if ssm_state is not None and ssm_state.shape[0] != B:
+            ssm_state = None
 
         if mask is not None:
             if mask.shape[0] != B:
                 mask = None
             else:
-                mixed_qkv = mx.where(mask[..., None], mixed_qkv, 0)
-        conv_input = mx.concatenate([conv_state, mixed_qkv], axis=1)
-        if cache is not None:
-            cache[0] = conv_input[:, -(self.conv_kernel_size - 1) :]
-        conv_out = nn.silu(self.conv1d(conv_input))
+                qkv = mx.where(mask[..., None], qkv, 0)
 
-        q, k, v = [
-            t.reshape(B, S, h, d)
-            for t, h, d in zip(
-                mx.split(conv_out, [self.key_dim, 2 * self.key_dim], -1),
-                [self.num_k_heads, self.num_k_heads, self.num_v_heads],
-                [self.head_k_dim, self.head_k_dim, self.head_v_dim],
+        if n_confirmed > 0 and n_confirmed < S:
+            # Split confirmed vs draft tokens for exact SSM rollback on rejection.
+            mask_c = mask[:, :n_confirmed] if mask is not None else None
+            mask_d = mask[:, n_confirmed:] if mask is not None else None
+            out_c, conv_c, ssm_c = self._process_chunk(
+                qkv[:, :n_confirmed],
+                a[:, :n_confirmed],
+                b[:, :n_confirmed],
+                conv_state,
+                ssm_state,
+                mask_c,
             )
-        ]
-
-        state = cache[1] if cache else None
-        if state is not None and state.shape[0] != B:
-            state = None
-        inv_scale = k.shape[-1] ** -0.5
-        q = (inv_scale**2) * mx.fast.rms_norm(q, None, 1e-6)
-        k = inv_scale * mx.fast.rms_norm(k, None, 1e-6)
-
-        out, state = gated_delta_update(
-            q,
-            k,
-            v,
-            a,
-            b,
-            self.A_log,
-            self.dt_bias,
-            state,
-            mask,
-            use_kernel=not self.training,
-        )
+            if cache is not None:
+                cache.rollback_state = (conv_c, ssm_c)
+            out_d, conv_f, ssm_f = self._process_chunk(
+                qkv[:, n_confirmed:],
+                a[:, n_confirmed:],
+                b[:, n_confirmed:],
+                conv_c,
+                ssm_c,
+                mask_d,
+            )
+            out = mx.concatenate([out_c, out_d], axis=1)
+        else:
+            out, conv_f, ssm_f = self._process_chunk(
+                qkv, a, b, conv_state, ssm_state, mask,
+            )
 
         if cache is not None:
-            cache[1] = state
+            cache[0] = conv_f
+            cache[1] = ssm_f
+            cache.advance(S)
 
         out = self.norm(out, z)
         return self.out_proj(out.reshape(B, S, -1))
@@ -347,9 +389,12 @@ class Qwen3_5DecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
@@ -452,7 +497,7 @@ class Qwen3_5Model(nn.Module):
 
         for layer, c in zip(self.layers, cache):
             m = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, m, c, position_ids)
+            h = layer(h, m, c, position_ids, n_confirmed=n_confirmed)
 
         return h  # return pre-norm hidden for MTP
 

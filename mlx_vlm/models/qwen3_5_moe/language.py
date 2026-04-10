@@ -116,9 +116,12 @@ class Qwen3_5MoeDecoderLayer(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
+        n_confirmed: int = 0,
     ) -> mx.array:
         if self.is_linear:
-            r = self.linear_attn(self.input_layernorm(x), mask, cache)
+            r = self.linear_attn(
+                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+            )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r

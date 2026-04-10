@@ -604,6 +604,10 @@ def mtp_generate_step(
         return draft_tok, draft_lp
 
     def _prefill(y):
+        # Reset stale mRoPE position cache from previous requests to avoid
+        # shape mismatch when the new prompt length differs.
+        lm._position_ids = None
+        lm._rope_deltas = None
         while y.size > 1:
             n = min(prefill_step_size, y.size - 1)
             lm(y[:n][None], cache=model_cache)
