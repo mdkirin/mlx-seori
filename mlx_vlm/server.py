@@ -1348,6 +1348,36 @@ async def health_check():
     }
 
 
+@app.get("/v1/status")
+async def server_status():
+    """Return detailed server status: memory, model, and prefix cache stats.
+
+    Designed for monitoring dashboards and health probes.
+    """
+    mem_info = {}
+    try:
+        active = mx.get_active_memory()
+        cache_mem = mx.get_cache_memory()
+        peak = mx.get_peak_memory()
+    except AttributeError:
+        active = mx.metal.get_active_memory()
+        cache_mem = mx.metal.get_cache_memory()
+        peak = mx.metal.get_peak_memory()
+    mem_info = {
+        "active_mb": round(active / 1e6, 1),
+        "cache_mb": round(cache_mem / 1e6, 1),
+        "peak_mb": round(peak / 1e6, 1),
+    }
+
+    return {
+        "status": "healthy",
+        "model": model_cache.get("model_path", None),
+        "adapter": model_cache.get("adapter_path", None),
+        "memory": mem_info,
+        "prompt_cache": prefix_cache.stats(),
+    }
+
+
 @app.post("/v1/warmup")
 async def warmup_endpoint(request: dict):
     """Prefill a system prompt and cache the KV/SSM state for TTFT optimization.
