@@ -248,6 +248,24 @@ def _record_last_request(
 
 
 # ── Request logger (JSONL) ──────────────────────────────────
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove <think>…</think> blocks and residual thinking preamble."""
+    if not text:
+        return text
+    # 1) 완전한 <think>...</think> 태그
+    result = _THINK_RE.sub("", text)
+    # 2) 닫는 태그만 있는 경우 (프리필에서 <think>가 주입되고 모델이 바로 </think> 출력)
+    if "</think>" in result:
+        result = result.split("</think>", 1)[-1]
+    # 3) 열린 <think> 태그가 남아있으면 제거
+    if "<think>" in result:
+        result = result.split("<think>", 1)[0]
+    return result.strip()
+
+
 _req_logger: Optional[logging.Logger] = None
 
 
@@ -1314,6 +1332,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             **template_kwargs,
         )
         generation_kwargs = build_generation_kwargs(request, template_kwargs)
+        _should_strip_thinking = not template_kwargs.get("enable_thinking", False)
 
         if request.stream:
             # Streaming response
@@ -1335,12 +1354,41 @@ async def chat_completions_endpoint(request: ChatRequest):
 
                     output_text = ""
                     request_id = f"chatcmpl-{uuid.uuid4()}"
+                    # ── Thinking 필터 (스트리밍) ──
+                    # enable_thinking=false 시: <think>...</think> 블록을 버퍼링하고
+                    # </think> 이후 실제 답변만 emit
+                    _tf_buf = ""       # thinking 버퍼
+                    _tf_active = _should_strip_thinking  # 필터 활성
+                    _tf_in_think = False
                     for chunk in token_iterator:
                         if chunk is None or not hasattr(chunk, "text"):
                             print("Warning: Received unexpected chunk format:", chunk)
                             continue
 
-                        output_text += chunk.text
+                        chunk_text = chunk.text
+                        if _tf_active:
+                            _tf_buf += chunk_text
+                            if not _tf_in_think:
+                                if "<think>" in _tf_buf:
+                                    _tf_in_think = True
+                                elif len(_tf_buf) > 50:
+                                    # thinking 없는 응답 → 버퍼 플러시
+                                    _tf_active = False
+                                    chunk_text = _tf_buf
+                                else:
+                                    continue  # 버퍼링 중
+                            if _tf_in_think:
+                                if "</think>" in _tf_buf:
+                                    # thinking 끝 → 실제 답변 시작
+                                    _tf_active = False
+                                    chunk_text = _tf_buf.split("</think>", 1)[-1].lstrip("\n")
+                                    _tf_buf = ""
+                                else:
+                                    continue  # thinking 중 → suppress
+                            if _tf_active:
+                                continue
+
+                        output_text += chunk_text
 
                         # Yield chunks in Server-Sent Events (SSE) format
                         usage_stats = {
@@ -1353,9 +1401,11 @@ async def chat_completions_endpoint(request: ChatRequest):
                             "peak_memory": chunk.peak_memory,
                         }
 
+                        if not chunk_text:
+                            continue  # 빈 청크 스킵
                         choices = [
                             ChatStreamChoice(
-                                delta=ChatMessage(role="assistant", content=chunk.text)
+                                delta=ChatMessage(role="assistant", content=chunk_text)
                             )
                         ]
                         chunk_data = ChatStreamChunk(
@@ -1457,6 +1507,8 @@ async def chat_completions_endpoint(request: ChatRequest):
                     prefix_cache=prefix_cache,
                     **generation_kwargs,
                 )
+                if _should_strip_thinking:
+                    gen_result.text = _strip_thinking(gen_result.text)
                 _elapsed = time.time() - _t0
                 _record_last_request(
                     prompt_tokens=gen_result.prompt_tokens,
