@@ -133,6 +133,10 @@ async def lifespan(app):
             if os.environ.get("MLX_PIN_MODEL", "").lower() in ("1", "true"):
                 _pinned_models.add(model_path)
                 print(f"Model pinned: {model_path}")
+            # Warmup은 /v1/warmup 엔드포인트로 수동 트리거 또는
+            # PrefixCache.warmup()으로 처리 (서버 시작 시 자동 warmup 제거 —
+            # 122B 65GB 모델 로딩 시간이 이미 길어서 startup lifespan 내에서
+            # 추가 추론은 GPU Timeout 위험 증가)
         except Exception as e:
             print(f"Failed to preload model: {e}")
             print("Server will continue without a preloaded model.")
