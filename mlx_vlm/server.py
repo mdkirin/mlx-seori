@@ -10,6 +10,7 @@ import traceback
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
+from pathlib import Path
 from typing import Any, List, Literal, Optional, Union
 
 import mlx.core as mx
@@ -1613,7 +1614,11 @@ async def chat_completions_endpoint(request: ChatRequest):
 @app.get("/v1/models", response_model=ModelsResponse, include_in_schema=False)
 def models_endpoint():
     """
-    Return list of locally downloaded MLX models.
+    현재 로드된(pinned) 모델을 맨 앞에, 그 뒤에 HF cache 의 MLX 모델들을 나열.
+
+    OpenAI 호환 클라이언트들이 첫 모델을 기본으로 쓰기 때문에 실제 구동 중인
+    모델이 가장 먼저 나와야 한다. upstream 기본 구현은 HF cache scan 만 하므로
+    `--model /absolute/path` 로 로드한 경우 응답 목록에서 누락되는 문제를 고친다.
     """
 
     files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
@@ -1635,6 +1640,23 @@ def models_endpoint():
         {"id": repo.repo_id, "object": "model", "created": int(repo.last_modified)}
         for repo in downloaded_models
     ]
+
+    # 현재 실제 로드된 모델을 맨 앞에 삽입 (중복 시 제거 후 재삽입)
+    loaded_path = model_cache.get("model_path") if isinstance(model_cache, dict) else None
+    if loaded_path:
+        # 로컬 절대경로면 디렉토리 이름을 id 로, HF repo id 형식이면 그대로
+        if loaded_path.startswith("/"):
+            loaded_id = Path(loaded_path).name
+        else:
+            loaded_id = loaded_path
+        # 캐시 스캔 결과에 동일 id 가 이미 있으면 제거
+        models = [m for m in models if m["id"] != loaded_id]
+        loaded_entry = {
+            "id": loaded_id,
+            "object": "model",
+            "created": int(time.time()),
+        }
+        models.insert(0, loaded_entry)
 
     response = {"object": "list", "data": models}
 
