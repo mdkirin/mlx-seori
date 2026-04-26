@@ -799,6 +799,23 @@ def suppress_tool_call_content(
     return in_tool_call, delta_content
 
 
+def build_generation_kwargs(
+    request: Any,
+    gen_args: "GenerationArguments",
+    template_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "prefill_step_size": get_prefill_step_size(),
+        "kv_bits": get_quantized_kv_bits(request.model),
+        "kv_group_size": get_kv_group_size(),
+        "kv_quant_scheme": get_kv_quant_scheme(),
+        "max_kv_size": get_max_kv_size(request.model),
+        "quantized_kv_start": get_quantized_kv_start(),
+        **gen_args.to_generate_kwargs(),
+        **template_kwargs,
+    }
+
+
 def process_tool_calls(model_output: str, tool_module, tools):
     """Parse tool calls from model output using the appropriate tool parser."""
     called_tools = []
@@ -2290,6 +2307,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 tool_module = load_tool_module(tool_parser_type)
 
         gen_args = _build_gen_args(request)
+        template_kwargs = gen_args.to_template_kwargs()
 
         formatted_prompt = apply_chat_template(
             processor,
@@ -2298,7 +2316,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             num_images=len(images),
             num_audios=len(audio),
             tools=tools,
-            **gen_args.to_template_kwargs(),
+            **template_kwargs,
         )
 
         logger.debug(
@@ -2311,7 +2329,7 @@ async def chat_completions_endpoint(request: ChatRequest):
             gen_args.temperature,
             request.stream,
         )
-        generation_kwargs = build_generation_kwargs(request, template_kwargs)
+        generation_kwargs = build_generation_kwargs(request, gen_args, template_kwargs)
         _should_strip_thinking = not template_kwargs.get("enable_thinking", False)
 
         if request.stream:
