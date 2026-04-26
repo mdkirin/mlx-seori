@@ -1,4 +1,5 @@
-from typing import Any, Optional
+from functools import partial
+from typing import Any, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -58,7 +59,7 @@ class Qwen3_5RotaryEmbedding:
         cos = mx.cos(emb)
         sin = mx.sin(emb)
 
-        return cos.astype(x.dtype), sin.astype(x.dtype)
+        return cos, sin
 
 
 def rotate_half(x):
@@ -78,8 +79,9 @@ def apply_multimodal_rotary_pos_emb(q, k, cos, sin, unqueeze_dim=1):
     k_rot = k[..., :rotary_dim]
     k_pass = k[..., rotary_dim:]
 
-    q_embed = (q_rot * cos) + (rotate_half(q_rot) * sin)
-    k_embed = (k_rot * cos) + (rotate_half(k_rot) * sin)
+    dtype = q.dtype
+    q_embed = ((q_rot * cos) + (rotate_half(q_rot) * sin)).astype(dtype)
+    k_embed = ((k_rot * cos) + (rotate_half(k_rot) * sin)).astype(dtype)
 
     q_embed = mx.concatenate([q_embed, q_pass], axis=-1)
     k_embed = mx.concatenate([k_embed, k_pass], axis=-1)
@@ -98,8 +100,15 @@ class Qwen3_5RMSNormGated(nn.Module):
     ) -> mx.array:
         x = mx.fast.rms_norm(hidden_states, self.weight, self.eps)
         if gate is not None:
-            x = swiglu(gate, x)
+            return _precise_swiglu(hidden_states, gate, x)
         return x.astype(hidden_states.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _precise_swiglu(h, gate, x):
+    gate = nn.silu(gate.astype(mx.float32))
+    x = x.astype(mx.float32)
+    return (gate * x).astype(h.dtype)
 
 
 class Qwen3_5Attention(nn.Module):
@@ -298,6 +307,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         mask: Optional[mx.array] = None,
         cache: Optional[Any] = None,
         n_confirmed: int = 0,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         B, S, _ = inputs.shape
 
@@ -390,16 +400,17 @@ class Qwen3_5DecoderLayer(nn.Module):
         cache: Optional[Any] = None,
         position_ids: Optional[mx.array] = None,
         n_confirmed: int = 0,
+        gdn_sink: Optional[list] = None,
     ) -> mx.array:
         if self.is_linear:
             r = self.linear_attn(
-                self.input_layernorm(x), mask, cache, n_confirmed=n_confirmed
+                self.input_layernorm(x), mask, cache,
+                n_confirmed=n_confirmed, gdn_sink=gdn_sink,
             )
         else:
             r = self.self_attn(self.input_layernorm(x), mask, cache, position_ids)
         h = x + r
-        out = h + self.mlp(self.post_attention_layernorm(h))
-        return out
+        return h + self.mlp(self.post_attention_layernorm(h))
 
 
 class MTPDecoderLayer(nn.Module):
@@ -483,6 +494,9 @@ class Qwen3_5Model(nn.Module):
         cache=None,
         position_ids: Optional[mx.array] = None,
         n_confirmed: int = 0,
+        capture_layer_ids: Optional[List[int]] = None,
+        hidden_sink: Optional[list] = None,
+        gdn_sink: Optional[list] = None,
     ):
         if inputs_embeds is None:
             h = self.embed_tokens(inputs)
@@ -495,9 +509,13 @@ class Qwen3_5Model(nn.Module):
         fa_mask = create_attention_mask(h, cache[self.fa_idx])
         ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
 
-        for layer, c in zip(self.layers, cache):
+        capture_set = set(capture_layer_ids) if capture_layer_ids else set()
+        for i, (layer, c) in enumerate(zip(self.layers, cache)):
             m = ssm_mask if layer.is_linear else fa_mask
-            h = layer(h, m, c, position_ids, n_confirmed=n_confirmed)
+            h = layer(h, m, c, position_ids,
+                      n_confirmed=n_confirmed, gdn_sink=gdn_sink)
+            if hidden_sink is not None and i in capture_set:
+                hidden_sink.append(h)
 
         return h  # return pre-norm hidden for MTP
 
@@ -516,6 +534,116 @@ class LanguageModel(nn.Module):
             self.lm_head = nn.Linear(args.hidden_size, args.vocab_size, bias=False)
         if getattr(args, "mtp_num_hidden_layers", 0) > 0:
             self.mtp = MTPModule(args)
+
+    def rollback_speculative_cache(
+        self,
+        caches: List[Any],
+        gdn_states: List,
+        accepted,
+        block_size: int,
+    ) -> int:
+        if isinstance(accepted, int):
+            accepted = mx.array([accepted])
+
+        max_a = int(accepted.max().item())
+        n = max_a + 1
+        trim = block_size - n
+        is_batch = accepted.size > 1
+        valid_ends = accepted + 1
+
+        # Separate trimmable (KV) caches from SSM caches.
+        ssm_caches = []
+        for c in caches:
+            if c is None:
+                continue
+            if c.is_trimmable():
+                if trim > 0:
+                    c.trim(trim)
+                if is_batch and hasattr(c, "_idx") and c.keys is not None and max_a > 0:
+                    kv_len = c._idx
+                    ve = valid_ends.tolist()
+                    verify_start = kv_len - n
+                    for bi in range(accepted.shape[0]):
+                        start = verify_start + int(ve[bi])
+                        if start < kv_len:
+                            c.keys[bi, :, start:kv_len, :] = 0
+                            c.values[bi, :, start:kv_len, :] = 0
+            else:
+                ssm_caches.append(c)
+
+        if not ssm_caches:
+            return max_a
+
+        # Batch all SSM rollbacks into a single gated_delta_update call
+        # to eliminate per-layer kernel launch overhead (~30 launches → 1).
+        N = len(ssm_caches)
+        replay_mask = None
+        if is_batch:
+            replay_mask = mx.arange(n)[None, :] <= accepted[:, None]
+
+        q_list, k_list, v_list, a_list, b_list = [], [], [], [], []
+        A_log_list, dt_bias_list, state_list = [], [], []
+        conv_data = []
+        for j in range(N):
+            q, k, v, a, b, A_log, dt_bias, init_state, mask, conv_input, K = gdn_states[
+                j
+            ]
+            q_list.append(q[:, :n])
+            k_list.append(k[:, :n])
+            v_list.append(v[:, :n])
+            a_list.append(a[:, :n])
+            b_list.append(b[:, :n])
+            A_log_list.append(A_log[None, None, :])  # (1, 1, Hv)
+            dt_bias_list.append(dt_bias[None, None, :])  # (1, 1, Hv)
+            state_list.append(init_state)
+            conv_data.append((conv_input, K))
+            if not is_batch and replay_mask is None and mask is not None:
+                replay_mask = mask[:, :n]
+
+        # Stack along batch dim: (N, n, H, D) — one kernel launch for all layers.
+        q_bat = mx.concatenate(q_list, axis=0)
+        k_bat = mx.concatenate(k_list, axis=0)
+        v_bat = mx.concatenate(v_list, axis=0)
+        a_bat = mx.concatenate(a_list, axis=0)
+        b_bat = mx.concatenate(b_list, axis=0)
+        A_log_bat = mx.concatenate(A_log_list, axis=0)  # (N, 1, Hv)
+        dt_bias_bat = mx.concatenate(dt_bias_list, axis=0)  # (N, 1, Hv)
+        state_bat = mx.concatenate(state_list, axis=0)  # (N, Hv, Dv, Dk)
+
+        if replay_mask is not None and replay_mask.shape[0] == 1 and N > 1:
+            replay_mask = mx.broadcast_to(replay_mask, (N, n))
+
+        _, states_out = gated_delta_update(
+            q_bat,
+            k_bat,
+            v_bat,
+            a_bat,
+            b_bat,
+            A_log_bat,
+            dt_bias_bat,
+            state_bat,
+            replay_mask,
+            use_kernel=True,
+        )
+
+        # Scatter results back to individual caches.
+        a0 = int(accepted[0].item()) if not is_batch else None
+        for j, c in enumerate(ssm_caches):
+            c[1] = states_out[j : j + 1]
+            conv_input, K = conv_data[j]
+            if is_batch:
+                acc_list = accepted.tolist()
+                slices = [
+                    conv_input[
+                        bi : bi + 1,
+                        int(acc_list[bi]) + 1 : int(acc_list[bi]) + K,
+                    ]
+                    for bi in range(accepted.shape[0])
+                ]
+                c[0] = mx.concatenate(slices, axis=0)
+            else:
+                c[0] = conv_input[:, a0 + 1 : a0 + K]
+        return max_a
 
     def get_rope_index(
         self,
@@ -697,19 +825,23 @@ class LanguageModel(nn.Module):
         pixel_values = kwargs.pop("pixel_values", None)
         image_grid_thw = kwargs.pop("image_grid_thw", None)
         video_grid_thw = kwargs.pop("video_grid_thw", None)
+        capture_layer_ids = kwargs.pop("capture_layer_ids", None)
+        rope_deltas_kw = kwargs.pop("rope_deltas", None)
         if pixel_values is not None:
             self._rope_deltas = None
             self._position_ids = None
 
         cache_offset = 0
+        cache_offsets = None  # per-element offsets for batched caches
         if cache and cache[self.model.fa_idx] is not None:
-            offset = cache[self.model.fa_idx].offset
-            if isinstance(offset, int):
-                cache_offset = offset
-            elif isinstance(offset, mx.array):
-                cache_offset = (offset if offset.ndim == 0 else offset[0]).item()
-            else:
-                raise ValueError(f"Unexpected cache offset type: {type(offset)}")
+            c0 = cache[self.model.fa_idx]
+            cache_offset = c0._idx if hasattr(c0, "_idx") else c0.offset
+            if (
+                isinstance(c0.offset, mx.array)
+                and c0.offset.ndim > 0
+                and c0.offset.size > 1
+            ):
+                cache_offsets = mx.maximum(c0.offset, 0)
 
         # Check if mask shape matches input shape (for chunked prefill compatibility)
         rope_mask = mask
@@ -717,6 +849,8 @@ class LanguageModel(nn.Module):
             rope_mask = None
 
         if position_ids is None and (rope_mask is None or rope_mask.ndim == 2):
+            batch_size, seq_length = inputs.shape
+
             if (
                 (
                     cache is not None
@@ -726,9 +860,11 @@ class LanguageModel(nn.Module):
                 or self._rope_deltas is None
                 or cache is None
             ):
-                # Use cached position_ids when available (pre-computed in get_input_embeddings)
-                if self._position_ids is not None:
-                    seq_length = inputs.shape[1]
+                if (
+                    self._position_ids is not None
+                    and self._position_ids.shape[1] == batch_size
+                    and self._position_ids.shape[-1] >= cache_offset + seq_length
+                ):
                     position_ids = self._position_ids[
                         :, :, cache_offset : cache_offset + seq_length
                     ]
@@ -739,26 +875,38 @@ class LanguageModel(nn.Module):
                     self._rope_deltas = rope_deltas
                     self._position_ids = position_ids
             else:
-                batch_size, seq_length = inputs.shape
-                delta = mx.array(
-                    cache_offset + self._rope_deltas if cache is not None else 0
-                )
-                position_ids = mx.arange(seq_length).reshape(1, -1)
-                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
-
-                if cache_offset is not None:
+                if cache_offsets is not None and cache_offsets.size >= batch_size:
+                    offsets = cache_offsets[:batch_size]
+                    rope_deltas = (
+                        rope_deltas_kw
+                        if rope_deltas_kw is not None
+                        else self._rope_deltas
+                    )
+                    if rope_deltas.shape[0] > batch_size:
+                        rope_deltas = rope_deltas[:batch_size]
+                    delta = (offsets + rope_deltas.squeeze(-1))[:, None]
+                else:
+                    delta = mx.array(
+                        cache_offset + self._rope_deltas if cache is not None else 0
+                    )
                     if delta.ndim == 0:
                         delta = mx.expand_dims(delta, axis=0)
-
                     if delta.shape[0] < batch_size:
                         delta = mx.tile(delta, (batch_size, 1))
                     else:
                         delta = delta[:batch_size]
 
+                position_ids = mx.arange(seq_length).reshape(1, -1)
+                position_ids = mx.broadcast_to(position_ids, (batch_size, seq_length))
                 position_ids = mx.add(position_ids, delta)[None, ...]
                 position_ids = mx.broadcast_to(
                     position_ids, (3, batch_size, seq_length)
                 )
+
+        hidden_sink: Optional[List[mx.array]] = (
+            [] if capture_layer_ids is not None else None
+        )
+        gdn_sink: Optional[list] = [] if capture_layer_ids is not None else None
 
         hidden = self.model(
             inputs,
@@ -766,6 +914,9 @@ class LanguageModel(nn.Module):
             inputs_embeds=inputs_embeds,
             position_ids=position_ids,
             n_confirmed=n_confirmed,
+            capture_layer_ids=capture_layer_ids,
+            hidden_sink=hidden_sink,
+            gdn_sink=gdn_sink,
         )
         normed = self.model.norm(hidden)
         if self.args.tie_word_embeddings:
@@ -774,7 +925,11 @@ class LanguageModel(nn.Module):
             out = self.lm_head(normed)
         if return_hidden:
             return out, hidden  # pre-norm hidden for MTP head
-        return LanguageModelOutput(logits=out)
+        return LanguageModelOutput(
+            logits=out,
+            hidden_states=hidden_sink,
+            gdn_states=gdn_sink,
+        )
 
     @property
     def layers(self):
