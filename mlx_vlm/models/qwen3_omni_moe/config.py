@@ -80,21 +80,21 @@ class VisionConfig(BaseModelConfig):
 
 @dataclass
 class TextConfig(BaseModelConfig):
-    num_hidden_layers: int
-    hidden_size: int
-    intermediate_size: int
-    num_attention_heads: int
-    num_experts: int
-    num_experts_per_tok: int
-    decoder_sparse_step: int
-    mlp_only_layers: List[int]
-    moe_intermediate_size: int
-    rms_norm_eps: float
-    vocab_size: int
-    num_key_value_heads: Optional[int]
-    head_dim: int
-    rope_theta: float
-    max_position_embeddings: int
+    num_hidden_layers: int = 0
+    hidden_size: int = 0
+    intermediate_size: int = 0
+    num_attention_heads: int = 0
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    decoder_sparse_step: int = 1
+    mlp_only_layers: List[int] = field(default_factory=list)
+    moe_intermediate_size: int = 0
+    rms_norm_eps: float = 1e-6
+    vocab_size: int = 0
+    num_key_value_heads: Optional[int] = None
+    head_dim: int = 128
+    rope_theta: float = 1000000.0
+    max_position_embeddings: int = 32768
     model_type: str = "qwen3_omni_moe_text_encoder"
     norm_topk_prob: bool = True
     rope_scaling: Optional[Dict[str, Union[float, str, bool, List[int]]]] = field(
