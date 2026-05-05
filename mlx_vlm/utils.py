@@ -694,6 +694,9 @@ def save_weights(
         shard_name = shard_file_format.format(i + 1, shards_count)
         shard_path = save_path / shard_name
 
+        # Skip empty-arrays (e.g. MoE experts sanitized incorrectly)
+        shard = {k: v for k, v in shard.items() if v.size > 0}
+
         mx.save_safetensors(str(shard_path), shard, metadata={"format": "mlx"})
 
         for weight_name in shard.keys():
@@ -1234,12 +1237,49 @@ def prepare_inputs(
             if feature_extractor is None:
                 raise ValueError("Processor missing feature_extractor for audio prep.")
 
-            audio_inputs = feature_extractor(
-                audio_arrays,
-                sampling_rate=feature_extractor.sampling_rate,
-                padding=True,
-                return_attention_mask=True,
-            )
+            # 30초 청크 분할: 긴 오디오를 30초 단위로 나누어 feature_extractor에 전달
+            # audio_tower가 내부적으로 청크 단위 처리하므로 feature도 청크별로 생성 후 연결
+            sr = feature_extractor.sampling_rate
+            chunk_samples = int(30 * sr)  # 30초 = 480,000 samples
+
+            all_features = []
+            all_masks = []
+            for audio_arr in audio_arrays:
+                # 30초 청크로 분할
+                chunks = []
+                for start in range(0, len(audio_arr), chunk_samples):
+                    chunk = audio_arr[start:start + chunk_samples]
+                    chunks.append(chunk)
+
+                # 각 청크를 feature_extractor로 처리
+                chunk_result = feature_extractor(
+                    chunks,
+                    sampling_rate=sr,
+                    padding=True,
+                    return_attention_mask=True,
+                )
+                # 청크별 features를 시간축으로 연결
+                feats = np.array(chunk_result["input_features"])  # (n_chunks, mel, time)
+                masks = np.array(chunk_result["attention_mask"])  # (n_chunks, time)
+
+                # 연결: (mel, total_time)
+                combined_feats = np.concatenate(feats, axis=-1)  # (mel, total_time)
+                combined_mask = np.concatenate(masks, axis=-1)   # (total_time,)
+                all_features.append(combined_feats)
+                all_masks.append(combined_mask)
+
+            # batch로 패딩
+            max_time = max(f.shape[-1] for f in all_features)
+            padded_features = np.zeros((len(all_features), all_features[0].shape[0], max_time), dtype=np.float32)
+            padded_masks = np.zeros((len(all_features), max_time), dtype=np.int32)
+            for i, (f, m) in enumerate(zip(all_features, all_masks)):
+                padded_features[i, :, :f.shape[-1]] = f
+                padded_masks[i, :len(m)] = m
+
+            audio_inputs = {
+                "input_features": padded_features,
+                "attention_mask": padded_masks,
+            }
 
             audio_feature_lengths = np.sum(
                 audio_inputs["attention_mask"], axis=-1, dtype=np.int32
@@ -1287,6 +1327,79 @@ def prepare_inputs(
             [(ids != processor.pad_token_id) for ids in input_ids]
         ).astype(mx.int32)
 
+    elif is_qwen3_omni_moe and audio_inputs is not None:
+        # Qwen3-Omni: 오디오를 직접 처리 (process_inputs_with_fallback 우회)
+        # 1. chat template 적용하여 audio placeholder 포함된 프롬프트 생성
+        tokenizer = processor.tokenizer
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.eos_token
+
+        # audio_pad 토큰을 오디오 feature 길이에 맞게 확장
+        # audio_tower 출력 길이를 정확한 함수로 계산
+        from mlx_vlm.models.qwen3_omni_moe.audio import (
+            _get_feat_extract_output_lengths,
+        )
+        feat_len = int(audio_feature_lengths[0])
+        audio_output_len = int(
+            _get_feat_extract_output_lengths(mx.array([feat_len]))[0]
+        )
+
+        audio_pad_token = "<|audio_pad|>"
+        audio_start_token = "<|audio_start|>"
+        audio_end_token = "<|audio_end|>"
+
+        # prompts에서 audio_pad 1개를 audio_output_len개로 확장
+        if isinstance(prompts, str):
+            # chat template이 이미 적용됐는지 확인
+            if audio_pad_token in prompts:
+                expanded = prompts.replace(
+                    audio_pad_token,
+                    audio_pad_token * audio_output_len,
+                    1,
+                )
+            elif audio_start_token in prompts:
+                # <|audio_start|><|audio_end|> 사이에 pad 삽입
+                expanded = prompts.replace(
+                    audio_start_token + audio_end_token,
+                    audio_start_token + audio_pad_token * audio_output_len + audio_end_token,
+                )
+            else:
+                # chat template 미적용 — 적용
+                conversation = [
+                    {"role": "system", "content": [{"type": "text", "text":
+                        "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
+                        "capable of perceiving auditory and visual inputs, as well as generating text and speech."}]},
+                    {"role": "user", "content": [
+                        {"type": "audio", "audio_url": "placeholder"},
+                        {"type": "text", "text": prompts},
+                    ]}
+                ]
+                expanded = processor.apply_chat_template(
+                    conversation, add_generation_prompt=True, tokenize=False
+                )
+                expanded = expanded.replace(
+                    audio_pad_token,
+                    audio_pad_token * audio_output_len,
+                )
+            prompts = expanded
+
+        text_inputs = tokenizer(
+            prompts,
+            add_special_tokens=add_special_tokens,
+            padding=padding,
+            return_tensors="np",
+        )
+        model_inputs["input_ids"] = mx.array(text_inputs["input_ids"])
+        model_inputs["attention_mask"] = mx.array(text_inputs["attention_mask"])
+        # 오디오 features 직접 설정
+        model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
+        model_inputs["input_features_mask"] = mx.array(
+            audio_inputs["attention_mask"]
+        ).astype(mx.int32)
+        model_inputs["audio_feature_lengths"] = mx.array(
+            audio_feature_lengths, dtype=mx.int32
+        )
+
     else:
         if hasattr(processor, "tokenizer") and processor.tokenizer.pad_token is None:
             processor.tokenizer.pad_token = processor.tokenizer.eos_token
@@ -1320,7 +1433,7 @@ def prepare_inputs(
 
     if audio_inputs is not None:
         model_inputs["input_features"] = mx.array(audio_inputs["input_features"])
-        model_inputs["feature_attention_mask"] = mx.array(
+        model_inputs["input_features_mask"] = mx.array(
             audio_inputs["attention_mask"]
         ).astype(mx.int32)
         model_inputs["audio_feature_lengths"] = mx.array(

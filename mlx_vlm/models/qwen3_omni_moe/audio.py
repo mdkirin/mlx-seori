@@ -196,6 +196,10 @@ class AudioModel(nn.Module):
         feature_lens: Optional[mx.array] = None,
         aftercnn_lens: Optional[mx.array] = None,
     ):
+        # input_features: (batch, mel_bins, time) or (mel_bins, time)
+        if input_features.ndim == 3:
+            input_features = input_features[0]  # squeeze batch → (mel_bins, time)
+
         if feature_lens is None:
             feature_lens = mx.array([input_features.shape[-1]], dtype=mx.int32)
 
