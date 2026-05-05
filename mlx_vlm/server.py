@@ -2332,6 +2332,15 @@ async def chat_completions_endpoint(request: ChatRequest):
         generation_kwargs = build_generation_kwargs(request, gen_args, template_kwargs)
         _should_strip_thinking = not template_kwargs.get("enable_thinking", False)
 
+        # PrefixCache 통합 (2026-05-05): warmup 된 prefix가 있고 텍스트만 요청이면
+        # ResponseGenerator(continuous batching) 우회하고 stream_generate fallback 사용
+        # → fallback path에 prefix_cache.try_restore() 통합되어 있음
+        _prefer_prefix_cache = (
+            prefix_cache.is_ready
+            and not images
+            and not audio
+        )
+
         if request.stream:
             # Streaming response using ResponseGenerator for continuous batching
             async def stream_generator():
@@ -2340,7 +2349,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                 token_iter = None  # For ResponseGenerator cleanup
                 try:
                     # Use ResponseGenerator if available, otherwise fall back to stream_generate
-                    if response_generator is not None:
+                    if response_generator is not None and not _prefer_prefix_cache:
                         # generate() does blocking Queue.get — run off event loop
                         ctx, token_iter = await asyncio.to_thread(
                             response_generator.generate,
@@ -2627,7 +2636,7 @@ async def chat_completions_endpoint(request: ChatRequest):
                     Tuple[int, float, Optional[List[Tuple[int, float]]]]
                 ] = []
 
-                if response_generator is not None:
+                if response_generator is not None and not _prefer_prefix_cache:
 
                     def _blocking_generate():
                         text = ""
