@@ -102,6 +102,21 @@ def main():
         help="Maximum KV cache size in tokens.",
     )
     parser.add_argument(
+        "--completion-batch-size",
+        type=int,
+        default=None,
+        help="Maximum concurrent completion requests batched in the generation pass. "
+             "Default 32. Reduce to lower KV cache pre-allocation memory "
+             "(useful for large models like Gemma 4 31B on single-user setups).",
+    )
+    parser.add_argument(
+        "--prefill-batch-size",
+        type=int,
+        default=None,
+        help="Maximum concurrent prefill requests batched together. Default 8. "
+             "Must be <= --completion-batch-size; reduce together to lower memory.",
+    )
+    parser.add_argument(
         "--quantized-kv-start",
         type=int,
         default=DEFAULT_QUANTIZED_KV_START,
@@ -177,6 +192,10 @@ def main():
     if args.max_kv_size is not None:
         os.environ["MAX_KV_SIZE"] = str(args.max_kv_size)
     os.environ["QUANTIZED_KV_START"] = str(args.quantized_kv_start)
+    if args.completion_batch_size is not None:
+        os.environ["MLX_VLM_COMPLETION_BATCH_SIZE"] = str(args.completion_batch_size)
+    if args.prefill_batch_size is not None:
+        os.environ["MLX_VLM_PREFILL_BATCH_SIZE"] = str(args.prefill_batch_size)
     if args.top_logprobs_k is not None:
         os.environ["TOP_LOGPROBS_K"] = str(args.top_logprobs_k)
 

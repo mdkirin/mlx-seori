@@ -513,6 +513,8 @@ class ResponseGenerator:
         quantized_kv_start=DEFAULT_QUANTIZED_KV_START,
         top_logprobs_k=0,
         apc_manager: Optional["_apc.APCManager"] = None,
+        completion_batch_size: Optional[int] = None,
+        prefill_batch_size: Optional[int] = None,
     ):
         self.model_path = model_path
         self.adapter_path = adapter_path
@@ -528,6 +530,8 @@ class ResponseGenerator:
         self.quantized_kv_start = quantized_kv_start
         self.top_logprobs_k = top_logprobs_k
         self.apc_manager = apc_manager
+        self.completion_batch_size = completion_batch_size
+        self.prefill_batch_size = prefill_batch_size
         self.tokenizer = None
         self.requests: Queue = Queue()
         self._stop = False
@@ -834,6 +838,8 @@ class ResponseGenerator:
                             top_logprobs_k=self.top_logprobs_k,
                             stream=generation_stream,
                             apc_manager=self.apc_manager,
+                            **({"completion_batch_size": self.completion_batch_size} if self.completion_batch_size else {}),
+                            **({"prefill_batch_size": self.prefill_batch_size} if self.prefill_batch_size else {}),
                         )
 
                     # Vision encoder runs on the GPU thread; text tokenization

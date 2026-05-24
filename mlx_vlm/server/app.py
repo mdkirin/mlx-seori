@@ -400,6 +400,10 @@ def get_cached_model(model_path: str, adapter_path=_INHERIT_ADAPTER):
         quantized_kv_start=quantized_kv_start,
         top_logprobs_k=get_top_logprobs_k(),
         apc_manager=runtime.apc_manager,
+        completion_batch_size=(int(os.environ['MLX_VLM_COMPLETION_BATCH_SIZE'])
+                               if os.environ.get('MLX_VLM_COMPLETION_BATCH_SIZE') else None),
+        prefill_batch_size=(int(os.environ['MLX_VLM_PREFILL_BATCH_SIZE'])
+                           if os.environ.get('MLX_VLM_PREFILL_BATCH_SIZE') else None),
     )
     try:
         model, processor, config = runtime.response_generator.wait_until_ready()
